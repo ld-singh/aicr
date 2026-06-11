@@ -161,7 +161,8 @@ func executeStepInProcess(ctx context.Context, try []v1alpha1.Operation, fetcher
 // defaults.AssertRetryInterval until it passes or the deadline expires.
 // Returns the last failure error on timeout, nil on success.
 func runAssertWithRetry(ctx context.Context, a *v1alpha1.Assert, fetcher ResourceFetcher, deadline time.Time) error {
-	var lastErr error
+	absentDeadline := time.Now().Add(defaults.AbsentResourceGracePeriod)
+	var lastErr, lastSubstantiveErr error
 	for {
 		lastErr = evaluateAssert(ctx, a, fetcher)
 		if lastErr == nil {
@@ -170,9 +171,19 @@ func runAssertWithRetry(ctx context.Context, a *v1alpha1.Assert, fetcher Resourc
 		if isTerminalAssertErr(lastErr) {
 			return lastErr
 		}
-		remaining := time.Until(deadline)
+		// Record the failure seen while the context is still live; after
+		// cancellation the fetch returns a context / rate-limiter error that
+		// masks the real reason (see preferSubstantiveErr).
+		if ctx.Err() == nil {
+			lastSubstantiveErr = lastErr
+		}
+		// An entirely-absent resource (NotFound) is bounded to the short
+		// AbsentResourceGracePeriod; a not-ready (shape-mismatch) resource
+		// keeps the full deadline so slow-but-healthy rollouts are not failed
+		// prematurely.
+		remaining := time.Until(notFoundGraceDeadline(lastErr, absentDeadline, deadline))
 		if remaining <= 0 {
-			return lastErr
+			return preferSubstantiveErr(lastSubstantiveErr, lastErr)
 		}
 		wait := defaults.AssertRetryInterval
 		if remaining < wait {
@@ -180,7 +191,8 @@ func runAssertWithRetry(ctx context.Context, a *v1alpha1.Assert, fetcher Resourc
 		}
 		select {
 		case <-ctx.Done():
-			return errors.Wrap(errors.ErrCodeInternal, "context canceled during assertion", ctx.Err())
+			return preferSubstantiveErr(lastSubstantiveErr,
+				errors.Wrap(errors.ErrCodeInternal, "context canceled during assertion", ctx.Err()))
 		case <-time.After(wait):
 		}
 	}
@@ -191,7 +203,7 @@ func runAssertWithRetry(ctx context.Context, a *v1alpha1.Assert, fetcher Resourc
 // matches) or the deadline expires. Returns the last failure on
 // timeout, nil on success.
 func runErrorWithRetry(ctx context.Context, e *v1alpha1.Error, fetcher ResourceFetcher, deadline time.Time) error {
-	var lastErr error
+	var lastErr, lastSubstantiveErr error
 	for {
 		lastErr = evaluateError(ctx, e, fetcher)
 		if lastErr == nil {
@@ -200,9 +212,15 @@ func runErrorWithRetry(ctx context.Context, e *v1alpha1.Error, fetcher ResourceF
 		if isTerminalAssertErr(lastErr) {
 			return lastErr
 		}
+		// Record the failure seen while the context is still live; after
+		// cancellation the fetch returns a context / rate-limiter error that
+		// masks the real reason (see preferSubstantiveErr).
+		if ctx.Err() == nil {
+			lastSubstantiveErr = lastErr
+		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			return lastErr
+			return preferSubstantiveErr(lastSubstantiveErr, lastErr)
 		}
 		wait := defaults.AssertRetryInterval
 		if remaining < wait {
@@ -210,7 +228,8 @@ func runErrorWithRetry(ctx context.Context, e *v1alpha1.Error, fetcher ResourceF
 		}
 		select {
 		case <-ctx.Done():
-			return errors.Wrap(errors.ErrCodeInternal, "context canceled during error check", ctx.Err())
+			return preferSubstantiveErr(lastSubstantiveErr,
+				errors.Wrap(errors.ErrCodeInternal, "context canceled during error check", ctx.Err()))
 		case <-time.After(wait):
 		}
 	}
@@ -225,6 +244,44 @@ func runErrorWithRetry(ctx context.Context, e *v1alpha1.Error, fetcher ResourceF
 // codes and continue to retry until the deadline.
 func isTerminalAssertErr(err error) bool {
 	return stderrors.Is(err, errors.New(errors.ErrCodeInvalidRequest, ""))
+}
+
+// preferSubstantiveErr returns the last assertion failure observed while the
+// context was still live, falling back to fallback (typically a context-
+// cancellation wrap) when no live failure was recorded. Once the parent
+// context is canceled, fetch calls fail with a context / client-go
+// rate-limiter error ("client rate limiter Wait returned an error: context
+// deadline exceeded") that masks the real assertion reason (e.g. "resource
+// not found"). Surfacing the substantive error keeps the check's verdict clean
+// — failed with the real reason — instead of an opaque errored status driven
+// by the cancellation artifact.
+func preferSubstantiveErr(substantive, fallback error) error {
+	if substantive != nil {
+		return substantive
+	}
+	return fallback
+}
+
+// isNotFoundErr reports whether err indicates the asserted resource does not
+// exist at all (as opposed to existing but not matching the expected shape,
+// which is ErrCodeInternal, or a transient API failure, which is
+// ErrCodeUnavailable). Only the entirely-absent case is subject to the
+// AbsentResourceGracePeriod fast-fail.
+func isNotFoundErr(err error) bool {
+	return stderrors.Is(err, errors.New(errors.ErrCodeNotFound, ""))
+}
+
+// notFoundGraceDeadline returns the effective retry deadline for the current
+// assertion error. A resource that does not exist at all (NotFound) is bounded
+// to absentDeadline so it fails fast instead of holding a worker slot for the
+// full readiness budget; anything else (not-ready shape mismatch, transient
+// API error) keeps the full deadline. The shorter of the two is never allowed
+// to exceed the caller's deadline.
+func notFoundGraceDeadline(err error, absentDeadline, deadline time.Time) time.Time {
+	if isNotFoundErr(err) && absentDeadline.Before(deadline) {
+		return absentDeadline
+	}
+	return deadline
 }
 
 // evaluateAssert runs a single positive assertion against the cluster.
